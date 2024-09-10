@@ -57,27 +57,7 @@ async fn spawn_jobs(job_requests: Vec<JobRequest>) -> JoinSet<Result<JobResponse
     set
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    if env::var("RUST_LOG").is_ok() {
-        env::set_var("RUST_LOG", "debug");
-    } else {
-        env::set_var("RUST_LOG", "info");
-    };
-    env_logger::init();
-
-    // TODO randomize job spawn for cpu-branching prediction
-    // TODO benchmark
-
-    const NUM_JOBS: usize = 10;
-    let jobs: Vec<usize> = (0..NUM_JOBS).collect();
-    let job_requests = jobs
-        .into_iter()
-        .map(|job_id| JobRequest::new(job_id, job_id as i32))
-        .collect::<Vec<JobRequest>>();
-
-    let mut set = spawn_jobs(job_requests).await;
-
+async fn join_all_with_retry(set: &mut JoinSet<Result<JobResponse>>) -> Result<i32> {
     let mut total = 0;
     while let Some(res) = set.join_next().await {
         let out = res?;
@@ -99,8 +79,67 @@ async fn main() -> Result<()> {
             },
         }
     }
+    Ok(total)
+}
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    if env::var("RUST_LOG").is_ok() {
+        env::set_var("RUST_LOG", "debug");
+    } else {
+        env::set_var("RUST_LOG", "info");
+    };
+    env_logger::init();
+
+    // TODO benchmark
+
+    const NUM_JOBS: usize = 10;
+    let jobs: Vec<usize> = (0..NUM_JOBS).collect();
+    let job_requests = jobs
+        .into_iter()
+        .map(|job_id| JobRequest::new(job_id, job_id as i32))
+        .collect::<Vec<JobRequest>>();
+
+    let mut set = spawn_jobs(job_requests).await;
+    let total = join_all_with_retry(&mut set).await?;
     info!("Total: {}", total);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_jobs(num_jobs: usize) -> Vec<JobRequest> {
+        let jobs: Vec<usize> = (0..num_jobs).collect();
+        jobs.into_iter()
+            .map(|job_id| JobRequest::new(job_id, job_id as i32))
+            .collect::<Vec<JobRequest>>()
+    }
+
+    #[tokio::test]
+    async fn test_process_job() {
+        let job = JobRequest::new(0, 2);
+        let result = process_job(job).await.unwrap();
+        assert_eq!(result.job_id, 0);
+        assert_eq!(result.result, 4);
+    }
+
+    #[tokio::test]
+    async fn test_process_job_odd() {
+        let job = JobRequest::new(1, 3);
+        let result = process_job(job).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "Job ID 1 is odd");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_jobs() {
+        let jobs = dummy_jobs(10);
+        let mut set = spawn_jobs(jobs).await;
+        let total = join_all_with_retry(&mut set).await.unwrap();
+        assert_eq!(set.len(), 0);
+        assert_eq!(total, 100);
+    }
 }
