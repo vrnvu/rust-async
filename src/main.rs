@@ -85,6 +85,28 @@ async fn join_all_with_retry(set: &mut JoinSet<Result<JobResponse>>) -> Result<i
     Ok(total)
 }
 
+async fn run_sequential(jobs: Vec<JobRequest>) -> Result<i32> {
+    let mut total = 0;
+    for job in jobs {
+        let result = process_job(job).await;
+        match result {
+            Ok(job_response) => {
+                total += job_response.result;
+            }
+            Err(e) => match e.downcast::<JobError>() {
+                Ok(JobError::Odd(job_id)) => {
+                    let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
+                    debug!("Retrying job {}", retry_job.job_id);
+                    let result = process_job(retry_job).await?;
+                    total += result.result;
+                }
+                Err(e) => panic!("Unexpected error: {}", e),
+            },
+        }
+    }
+    Ok(total)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = cli::Cli::parse();
@@ -104,10 +126,17 @@ async fn main() -> Result<()> {
                 .collect::<Vec<JobRequest>>();
 
             let mut set = spawn_jobs(job_requests).await;
-            let total = join_all_with_retry(&mut set).await?;
-            Ok(total)
+            join_all_with_retry(&mut set).await
         }
-        cli::Commands::Sequential => Err(anyhow::anyhow!("Not implemented")),
+        cli::Commands::Sequential { jobs } => {
+            let jobs: Vec<usize> = (0..jobs).collect();
+            let job_requests = jobs
+                .into_iter()
+                .map(|job_id| JobRequest::new(job_id, job_id as i32))
+                .collect::<Vec<JobRequest>>();
+
+            run_sequential(job_requests).await
+        }
     }?;
     info!("Total: {}", result);
     Ok(())
