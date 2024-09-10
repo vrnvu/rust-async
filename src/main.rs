@@ -49,14 +49,21 @@ async fn process_job(job: JobRequest) -> Result<JobResponse> {
     })
 }
 
+async fn spawn_jobs(job_requests: Vec<JobRequest>) -> JoinSet<Result<JobResponse>> {
+    let mut set: JoinSet<Result<JobResponse>> = JoinSet::new();
+    for job in job_requests {
+        set.spawn(process_job(job));
+    }
+    set
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let debug = env::var("DEBUG").is_ok();
-    if debug {
-        env::set_var("RUST_LOG", "debug")
+    if env::var("RUST_LOG").is_ok() {
+        env::set_var("RUST_LOG", "debug");
     } else {
-        env::set_var("RUST_LOG", "info")
-    }
+        env::set_var("RUST_LOG", "info");
+    };
     env_logger::init();
 
     // TODO randomize job spawn for cpu-branching prediction
@@ -69,10 +76,7 @@ async fn main() -> Result<()> {
         .map(|job_id| JobRequest::new(job_id, job_id as i32))
         .collect::<Vec<JobRequest>>();
 
-    let mut set: JoinSet<Result<JobResponse>> = JoinSet::new();
-    for job in job_requests {
-        set.spawn(process_job(job));
-    }
+    let mut set = spawn_jobs(job_requests).await;
 
     let mut total = 0;
     while let Some(res) = set.join_next().await {
