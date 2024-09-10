@@ -1,4 +1,7 @@
+use std::env;
+
 use anyhow::Result;
+use log::{debug, error, info};
 use thiserror;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
@@ -28,18 +31,18 @@ struct JobResponse {
 }
 
 async fn process_job(job: JobRequest) -> Result<JobResponse> {
-    println!("Worker received job: {:?}", job);
+    debug!("Worker received job: {:?}", job);
     sleep(Duration::from_secs(1)).await; // Simulate some work
     let result = job.request * 2;
 
     // If the job is odd, fail and retry
     if job.request % 2 != 0 {
         let error = JobError::Odd(job.job_id).into();
-        println!("Job failed: {}", error);
+        debug!("Job failed: {}", error);
         return Err(error);
     }
 
-    println!("Worker processed job {}: result {}", job.job_id, result);
+    debug!("Worker processed job {}: result {}", job.job_id, result);
     Ok(JobResponse {
         job_id: job.job_id,
         result,
@@ -48,12 +51,18 @@ async fn process_job(job: JobRequest) -> Result<JobResponse> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // TODO add env logger
-    // TODO change println to logger
+    let debug = env::var("DEBUG").is_ok();
+    if debug {
+        env::set_var("RUST_LOG", "debug")
+    } else {
+        env::set_var("RUST_LOG", "info")
+    }
+    env_logger::init();
+
     // TODO randomize job spawn for cpu-branching prediction
     // TODO benchmark
 
-    const NUM_JOBS: usize = 100;
+    const NUM_JOBS: usize = 10;
     let jobs: Vec<usize> = (0..NUM_JOBS).collect();
     let job_requests = jobs
         .into_iter()
@@ -70,7 +79,7 @@ async fn main() -> Result<()> {
         let out = res?;
         match out {
             Ok(job_response) => {
-                println!(
+                debug!(
                     "Job {} completed successfully with result {}",
                     job_response.job_id, job_response.result
                 );
@@ -79,7 +88,7 @@ async fn main() -> Result<()> {
             Err(e) => match e.downcast::<JobError>() {
                 Ok(JobError::Odd(job_id)) => {
                     let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
-                    println!("Retrying job {}", retry_job.job_id);
+                    debug!("Retrying job {}", retry_job.job_id);
                     set.spawn(process_job(retry_job));
                 }
                 Err(e) => panic!("Unexpected error: {}", e),
@@ -87,7 +96,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("Total: {}", total);
+    info!("Total: {}", total);
 
     Ok(())
 }
