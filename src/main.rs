@@ -1,10 +1,13 @@
 use std::env;
 
 use anyhow::Result;
+use clap::Parser;
 use log::{debug, error, info};
 use thiserror;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
+
+mod cli;
 
 #[derive(thiserror::Error, Debug)]
 enum JobError {
@@ -84,30 +87,29 @@ async fn join_all_with_retry(set: &mut JoinSet<Result<JobResponse>>) -> Result<i
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if env::var("RUST_LOG").is_ok() {
-        env::set_var("RUST_LOG", "debug");
+    let args = cli::Cli::parse();
+    if args.verbose {
+        env::set_var("RUST_LOG", "debug")
     } else {
-        env::set_var("RUST_LOG", "info");
-    };
+        env::set_var("RUST_LOG", "info")
+    }
     env_logger::init();
 
-    if env::args().len() != 2 {
-        error!("Usage: {} <num_jobs>", env::args().next().unwrap());
-        std::process::exit(1);
-    }
+    let result = match args.command {
+        cli::Commands::Parallel { jobs } => {
+            let jobs: Vec<usize> = (0..jobs).collect();
+            let job_requests = jobs
+                .into_iter()
+                .map(|job_id| JobRequest::new(job_id, job_id as i32))
+                .collect::<Vec<JobRequest>>();
 
-    let num_jobs: usize = env::args().nth(1).unwrap().parse().unwrap();
-
-    let jobs: Vec<usize> = (0..num_jobs).collect();
-    let job_requests = jobs
-        .into_iter()
-        .map(|job_id| JobRequest::new(job_id, job_id as i32))
-        .collect::<Vec<JobRequest>>();
-
-    let mut set = spawn_jobs(job_requests).await;
-    let total = join_all_with_retry(&mut set).await?;
-    info!("Total: {}", total);
-
+            let mut set = spawn_jobs(job_requests).await;
+            let total = join_all_with_retry(&mut set).await?;
+            Ok(total)
+        }
+        cli::Commands::Sequential => Err(anyhow::anyhow!("Not implemented")),
+    }?;
+    info!("Total: {}", result);
     Ok(())
 }
 
