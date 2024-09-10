@@ -91,10 +91,14 @@ async fn main() -> Result<()> {
     };
     env_logger::init();
 
-    // TODO benchmark
+    if env::args().len() != 2 {
+        error!("Usage: {} <num_jobs>", env::args().next().unwrap());
+        std::process::exit(1);
+    }
 
-    const NUM_JOBS: usize = 10;
-    let jobs: Vec<usize> = (0..NUM_JOBS).collect();
+    let num_jobs: usize = env::args().nth(1).unwrap().parse().unwrap();
+
+    let jobs: Vec<usize> = (0..num_jobs).collect();
     let job_requests = jobs
         .into_iter()
         .map(|job_id| JobRequest::new(job_id, job_id as i32))
