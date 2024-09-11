@@ -26,10 +26,4 @@ pub enum Commands {
         #[clap(short, long)]
         workers: usize,
     },
-    /// Sequentail mode
-    Sequential {
-        /// sets the number of jobs
-        #[clap(short, long)]
-        jobs: usize,
-    },
 }

@@ -1,10 +1,8 @@
-use std::{collections::HashSet, env};
+use std::env;
 
 use anyhow::Result;
 use clap::Parser;
-use log::{debug, error, info};
-use thiserror;
-use tokio::{select, sync::mpsc};
+use log::info;
 
 mod cli;
 
@@ -123,7 +121,6 @@ async fn main() -> Result<()> {
             }
             anyhow::Ok(total)
         }
-        cli::Commands::Sequential { jobs } => Ok(10),
     }?;
 
     info!("Total: {}", result);
