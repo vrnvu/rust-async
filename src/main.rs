@@ -1,13 +1,43 @@
-use std::env;
+use std::{collections::HashSet, env};
 
 use anyhow::Result;
 use clap::Parser;
 use log::{debug, error, info};
 use thiserror;
-use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::{select, sync::mpsc};
 
 mod cli;
+
+async fn process(
+    worker_id: usize,
+    mut input_rx: mpsc::Receiver<JobRequest>,
+    output_tx: mpsc::Sender<Result<JobResponse>>,
+) -> Result<()> {
+    while let Some(job) = input_rx.recv().await {
+        info!(
+            "Worker {} processing job {} with request {}",
+            worker_id, job.job_id, job.request
+        );
+
+        // Simulate some work and logs
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if job.request % 2 != 0 {
+            info!("Job {} is odd", job.job_id);
+        }
+
+        let response = if job.request % 2 != 0 {
+            Err(JobError::Odd(job.job_id).into())
+        } else {
+            Ok(JobResponse {
+                job_id: job.job_id,
+                result: job.request * 2,
+            })
+        };
+
+        output_tx.send(response).await?;
+    }
+    Ok(())
+}
 
 #[derive(thiserror::Error, Debug)]
 enum JobError {
@@ -33,80 +63,6 @@ struct JobResponse {
     result: i32,
 }
 
-async fn process_job(job: JobRequest) -> Result<JobResponse> {
-    debug!("Worker received job: {:?}", job);
-    sleep(Duration::from_secs(1)).await; // Simulate some work
-    let result = job.request * 2;
-
-    // If the job is odd, fail and retry
-    if job.request % 2 != 0 {
-        let error = JobError::Odd(job.job_id).into();
-        debug!("Job failed: {}", error);
-        return Err(error);
-    }
-
-    debug!("Worker processed job {}: result {}", job.job_id, result);
-    Ok(JobResponse {
-        job_id: job.job_id,
-        result,
-    })
-}
-
-async fn spawn_jobs(job_requests: Vec<JobRequest>) -> JoinSet<Result<JobResponse>> {
-    let mut set: JoinSet<Result<JobResponse>> = JoinSet::new();
-    for job in job_requests {
-        set.spawn(process_job(job));
-    }
-    set
-}
-
-async fn join_all_with_retry(set: &mut JoinSet<Result<JobResponse>>) -> Result<i32> {
-    let mut total = 0;
-    while let Some(res) = set.join_next().await {
-        let out = res?;
-        match out {
-            Ok(job_response) => {
-                debug!(
-                    "Job {} completed successfully with result {}",
-                    job_response.job_id, job_response.result
-                );
-                total += job_response.result;
-            }
-            Err(e) => match e.downcast::<JobError>() {
-                Ok(JobError::Odd(job_id)) => {
-                    let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
-                    debug!("Retrying job {}", retry_job.job_id);
-                    set.spawn(process_job(retry_job));
-                }
-                Err(e) => panic!("Unexpected error: {}", e),
-            },
-        }
-    }
-    Ok(total)
-}
-
-async fn run_sequential(jobs: Vec<JobRequest>) -> Result<i32> {
-    let mut total = 0;
-    for job in jobs {
-        let result = process_job(job).await;
-        match result {
-            Ok(job_response) => {
-                total += job_response.result;
-            }
-            Err(e) => match e.downcast::<JobError>() {
-                Ok(JobError::Odd(job_id)) => {
-                    let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
-                    debug!("Retrying job {}", retry_job.job_id);
-                    let result = process_job(retry_job).await?;
-                    total += result.result;
-                }
-                Err(e) => panic!("Unexpected error: {}", e),
-            },
-        }
-    }
-    Ok(total)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = cli::Cli::parse();
@@ -117,64 +73,108 @@ async fn main() -> Result<()> {
     }
     env_logger::init();
 
-    let result = match args.command {
+    let result: i32 = match args.command {
         cli::Commands::Parallel { jobs } => {
-            let jobs: Vec<usize> = (0..jobs).collect();
-            let job_requests = jobs
-                .into_iter()
+            let job_requests = (0..jobs)
                 .map(|job_id| JobRequest::new(job_id, job_id as i32))
                 .collect::<Vec<JobRequest>>();
 
-            let mut set = spawn_jobs(job_requests).await;
-            join_all_with_retry(&mut set).await
-        }
-        cli::Commands::Sequential { jobs } => {
-            let jobs: Vec<usize> = (0..jobs).collect();
-            let job_requests = jobs
-                .into_iter()
-                .map(|job_id| JobRequest::new(job_id, job_id as i32))
-                .collect::<Vec<JobRequest>>();
+            let mut worker_input_tx: Vec<mpsc::Sender<JobRequest>> = vec![];
+            let mut worker_input_rx: Vec<mpsc::Receiver<JobRequest>> = vec![];
+            let mut worker_output_tx: Vec<mpsc::Sender<Result<JobResponse>>> = vec![];
+            let mut worker_output_rx: Vec<mpsc::Receiver<Result<JobResponse>>> = vec![];
 
-            run_sequential(job_requests).await
+            for _ in 0..2 {
+                let (tx_input, rx_input) = mpsc::channel(1);
+                let (tx_output, rx_output) = mpsc::channel(1);
+
+                worker_input_tx.push(tx_input);
+                worker_input_rx.push(rx_input);
+                worker_output_tx.push(tx_output);
+                worker_output_rx.push(rx_output);
+            }
+
+            for id in 0..2 {
+                // We can safely take ownership of the channels here because we are not going to use them anymore
+                let worker_output_tx = worker_output_tx.remove(0);
+                let worker_input_rx = worker_input_rx.remove(0);
+                tokio::spawn(async move { process(id, worker_input_rx, worker_output_tx).await });
+            }
+
+            for job in job_requests {
+                let idx = job.job_id % 2;
+                let tx = worker_input_tx[idx].clone();
+                // We need to send them async or the main will block with a buffered channel of size 1
+                // This is because we are reading the results later in the main thread with a select!
+                tokio::spawn(async move {
+                    tx.send(job).await.unwrap();
+                });
+            }
+
+            let mut worker_output_rx_0 = worker_output_rx.remove(0);
+            let mut worker_output_rx_1 = worker_output_rx.remove(0);
+            let mut total: i32 = 0;
+            let mut jobs_completed = HashSet::new();
+            loop {
+                select! {
+                    res = worker_output_rx_0.recv() => {
+                        if let Some(res) = res {
+                            match res {
+                                Ok(job_response) => {
+                                    info!("Received result from worker 0: {}", job_response.result);
+                                    total += job_response.result;
+                                    jobs_completed.insert(job_response.job_id);
+                                    if jobs_completed.len() == jobs {
+                                        break;
+                                    }
+                                },
+                                Err(e) => match e.downcast::<JobError>() {
+                                    Ok(JobError::Odd(job_id)) => {
+                                        let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
+                                        let tx = worker_input_tx[job_id % 2].clone();
+                                        info!("Retrying job {}", retry_job.job_id);
+                                        tokio::spawn(async move {
+                                            tx.send(retry_job).await.unwrap();
+                                        });
+                                    }
+                                    Err(e) => panic!("Unexpected error: {}", e),
+                                },
+                            }
+                        }
+                    },
+                    res = worker_output_rx_1.recv() => {
+                        if let Some(res) = res {
+                            match res {
+                                Ok(job_response) => {
+                                    info!("Received result from worker 0: {}", job_response.result);
+                                    total += job_response.result;
+                                    jobs_completed.insert(job_response.job_id);
+                                    if jobs_completed.len() == jobs {
+                                        break;
+                                    }
+                                },
+                                Err(e) => match e.downcast::<JobError>() {
+                                    Ok(JobError::Odd(job_id)) => {
+                                        let retry_job = JobRequest::new(job_id, job_id as i32 + 1);
+                                        let tx = worker_input_tx[job_id % 2].clone();
+                                        info!("Retrying job {}", retry_job.job_id);
+                                        tokio::spawn(async move {
+                                            tx.send(retry_job).await.unwrap();
+                                        });
+                                    }
+                                    Err(e) => panic!("Unexpected error: {}", e),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+
+            anyhow::Ok(total)
         }
+        cli::Commands::Sequential { jobs } => Ok(10),
     }?;
+
     info!("Total: {}", result);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dummy_jobs(num_jobs: usize) -> Vec<JobRequest> {
-        let jobs: Vec<usize> = (0..num_jobs).collect();
-        jobs.into_iter()
-            .map(|job_id| JobRequest::new(job_id, job_id as i32))
-            .collect::<Vec<JobRequest>>()
-    }
-
-    #[tokio::test]
-    async fn test_process_job() {
-        let job = JobRequest::new(0, 2);
-        let result = process_job(job).await.unwrap();
-        assert_eq!(result.job_id, 0);
-        assert_eq!(result.result, 4);
-    }
-
-    #[tokio::test]
-    async fn test_process_job_odd() {
-        let job = JobRequest::new(1, 3);
-        let result = process_job(job).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "Job ID 1 is odd");
-    }
-
-    #[tokio::test]
-    async fn test_spawn_jobs() {
-        let jobs = dummy_jobs(10);
-        let mut set = spawn_jobs(jobs).await;
-        let total = join_all_with_retry(&mut set).await.unwrap();
-        assert_eq!(set.len(), 0);
-        assert_eq!(total, 100);
-    }
 }
